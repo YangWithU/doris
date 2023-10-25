@@ -17,10 +17,12 @@
 
 #include <glog/logging.h>
 #include <limits.h>
+#include <parquet/column_writer.h>
 #include <stdint.h>
 
 #include <algorithm>
 #include <boost/iterator/iterator_facade.hpp>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <tuple>
@@ -28,12 +30,14 @@
 #include <vector>
 
 #include "common/status.h"
+#include "runtime/decimalv2_value.h"
 #include "runtime/define_primitive_type.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
 #include "udf/udf.h"
 #include "util/binary_cast.hpp"
 #include "util/datetype_cast.hpp"
+#include "util/time.h"
 #include "util/time_lut.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
@@ -53,6 +57,7 @@
 #include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_date.h"
 #include "vec/data_types/data_type_date_time.h"
+#include "vec/data_types/data_type_decimal.h"
 #include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
@@ -579,6 +584,91 @@ struct UnixTimeStampDateImpl {
     static DataTypes get_variadic_argument_types() { return {std::make_shared<DateType>()}; }
 
     static DataTypePtr get_return_type_impl(const ColumnsWithTypeAndName& arguments) {
+        if constexpr (std::is_same_v<DateType, DataTypeDateTimeV2>) {
+            if (arguments[0].type->is_nullable()) {
+                return make_nullable(std::make_shared<DataTypeDecimal<Decimal64>>(16, 6));
+            }
+            return std::make_shared<DataTypeDecimal<Decimal64>>(16, 6);
+        } else {
+            if (arguments[0].type->is_nullable()) {
+                return make_nullable(std::make_shared<DataTypeInt32>());
+            }
+            return std::make_shared<DataTypeInt32>();
+        }
+    }
+
+    static Status execute_impl(FunctionContext* context, Block& block,
+                               const ColumnNumbers& arguments, size_t result,
+                               size_t input_rows_count) {
+        const ColumnPtr& col_source = block.get_by_position(arguments[0]).column;
+        DCHECK(!col_source->is_nullable());
+
+        if constexpr (std::is_same_v<DateType, DataTypeDate>) {
+            auto col_result = ColumnVector<Int32>::create();
+            auto& col_result_data = col_result->get_data();
+            col_result->resize(input_rows_count);
+
+            for (int i = 0; i < input_rows_count; i++) {
+                StringRef source = col_source->get_data_at(i);
+                const auto& ts_value = reinterpret_cast<const VecDateTimeValue&>(*source.data);
+                int64_t timestamp {};
+                ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj());
+                col_result_data[i] = UnixTimeStampImpl::trim_timestamp(timestamp);
+            }
+            block.replace_by_position(result, std::move(col_result));
+        } else if constexpr (std::is_same_v<DateType, DataTypeDateV2>) {
+            auto col_result = ColumnVector<Int32>::create();
+            auto& col_result_data = col_result->get_data();
+            col_result->resize(input_rows_count);
+
+            for (int i = 0; i < input_rows_count; i++) {
+                StringRef source = col_source->get_data_at(i);
+                const auto& ts_value =
+                        reinterpret_cast<const DateV2Value<DateV2ValueType>&>(*source.data);
+                int64_t timestamp {};
+                const auto valid =
+                        ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj());
+                DCHECK(valid);
+                col_result_data[i] = UnixTimeStampImpl::trim_timestamp(timestamp);
+            }
+            block.replace_by_position(result, std::move(col_result));
+        } else { // DatetimeV2
+            UInt32 scale = block.get_by_position(arguments[0]).type->get_scale();
+            auto col_result = ColumnDecimal<Decimal64>::create(input_rows_count, scale);
+            auto& col_result_data = col_result->get_data();
+            col_result->resize(input_rows_count);
+
+            for (int i = 0; i < input_rows_count; i++) {
+                StringRef source = col_source->get_data_at(i);
+                const auto& ts_value =
+                        reinterpret_cast<const DateV2Value<DateTimeV2ValueType>&>(*source.data);
+                std::pair<int64_t, int64_t> timestamp {};
+                const auto valid =
+                        ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj());
+                DCHECK(valid);
+
+                auto& [sec, ms] = timestamp;
+                sec = UnixTimeStampImpl::trim_timestamp(sec);
+
+                col_result_data[i] = Decimal64::from_int_frac(sec, ms, 6).value;
+            }
+            block.replace_by_position(result, std::move(col_result));
+        }
+
+        return Status::OK();
+    }
+};
+
+template <typename DateType>
+struct UnixTimeStampDatetimeImpl : public UnixTimeStampDateImpl<DateType> {
+    static DataTypes get_variadic_argument_types() { return {std::make_shared<DateType>()}; }
+};
+
+template <typename DateType>
+struct UnixTimeStampDateImplOld {
+    static DataTypes get_variadic_argument_types() { return {std::make_shared<DateType>()}; }
+
+    static DataTypePtr get_return_type_impl(const ColumnsWithTypeAndName& arguments) {
         RETURN_REAL_TYPE_FOR_DATEV2_FUNCTION(DataTypeInt32);
     }
 
@@ -605,7 +695,7 @@ struct UnixTimeStampDateImpl {
                 StringRef source = col_source->get_data_at(i);
                 const VecDateTimeValue& ts_value =
                         reinterpret_cast<const VecDateTimeValue&>(*source.data);
-                int64_t timestamp;
+                int64_t timestamp {};
                 if (!ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj())) {
                     null_map_data[i] = true;
                 } else {
@@ -630,7 +720,7 @@ struct UnixTimeStampDateImpl {
                     StringRef source = col_source->get_data_at(i);
                     const DateV2Value<DateV2ValueType>& ts_value =
                             reinterpret_cast<const DateV2Value<DateV2ValueType>&>(*source.data);
-                    int64_t timestamp;
+                    int64_t timestamp {};
                     if (!ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj())) {
                         null_map_data[i] = true;
                     } else {
@@ -646,7 +736,7 @@ struct UnixTimeStampDateImpl {
                     StringRef source = col_source->get_data_at(i);
                     const DateV2Value<DateV2ValueType>& ts_value =
                             reinterpret_cast<const DateV2Value<DateV2ValueType>&>(*source.data);
-                    int64_t timestamp;
+                    int64_t timestamp {};
                     const auto valid =
                             ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj());
                     DCHECK(valid);
@@ -669,7 +759,7 @@ struct UnixTimeStampDateImpl {
                     StringRef source = col_source->get_data_at(i);
                     const DateV2Value<DateTimeV2ValueType>& ts_value =
                             reinterpret_cast<const DateV2Value<DateTimeV2ValueType>&>(*source.data);
-                    int64_t timestamp;
+                    int64_t timestamp {};
                     if (!ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj())) {
                         null_map_data[i] = true;
                     } else {
@@ -685,7 +775,7 @@ struct UnixTimeStampDateImpl {
                     StringRef source = col_source->get_data_at(i);
                     const DateV2Value<DateTimeV2ValueType>& ts_value =
                             reinterpret_cast<const DateV2Value<DateTimeV2ValueType>&>(*source.data);
-                    int64_t timestamp;
+                    int64_t timestamp {};
                     const auto valid =
                             ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj());
                     DCHECK(valid);
@@ -700,7 +790,7 @@ struct UnixTimeStampDateImpl {
 };
 
 template <typename DateType>
-struct UnixTimeStampDatetimeImpl : public UnixTimeStampDateImpl<DateType> {
+struct UnixTimeStampDatetimeImplOld : public UnixTimeStampDateImplOld<DateType> {
     static DataTypes get_variadic_argument_types() { return {std::make_shared<DateType>()}; }
 };
 
@@ -743,7 +833,7 @@ struct UnixTimeStampStrImpl {
                 continue;
             }
 
-            int64_t timestamp;
+            int64_t timestamp {};
             if (!ts_value.unix_timestamp(&timestamp, context->state()->timezone_obj())) {
                 null_map_data[i] = true;
             } else {
@@ -766,8 +856,6 @@ public:
     static FunctionPtr create() { return std::make_shared<FunctionUnixTimestamp<Impl>>(); }
 
     String get_name() const override { return name; }
-
-    bool use_default_implementation_for_nulls() const override { return false; }
 
     size_t get_number_of_arguments() const override {
         return get_variadic_argument_types_impl().size();
@@ -1298,10 +1386,6 @@ void register_function_timestamp(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionUnixTimestamp<UnixTimeStampDateImpl<DataTypeDate>>>();
     factory.register_function<FunctionUnixTimestamp<UnixTimeStampDateImpl<DataTypeDateV2>>>();
     factory.register_function<FunctionUnixTimestamp<UnixTimeStampDateImpl<DataTypeDateTimeV2>>>();
-    factory.register_function<FunctionUnixTimestamp<UnixTimeStampDatetimeImpl<DataTypeDate>>>();
-    factory.register_function<FunctionUnixTimestamp<UnixTimeStampDatetimeImpl<DataTypeDateV2>>>();
-    factory.register_function<
-            FunctionUnixTimestamp<UnixTimeStampDatetimeImpl<DataTypeDateTimeV2>>>();
     factory.register_function<FunctionUnixTimestamp<UnixTimeStampStrImpl>>();
     factory.register_function<FunctionDateOrDateTimeToDate<LastDayImpl, DataTypeDateTime>>();
     factory.register_function<FunctionDateOrDateTimeToDate<LastDayImpl, DataTypeDate>>();
@@ -1315,6 +1399,10 @@ void register_function_timestamp(SimpleFunctionFactory& factory) {
     factory.register_function<DateTimeToTimestamp<MicroSec>>();
     factory.register_function<DateTimeToTimestamp<MilliSec>>();
     factory.register_function<DateTimeToTimestamp<Sec>>();
+
+    /// @TEMPORARY: for be_exec_version=3
+    factory.register_alternative_function<
+            FunctionUnixTimestamp<UnixTimeStampDateImplOld<DataTypeDateTimeV2>>>();
 }
 
 } // namespace doris::vectorized

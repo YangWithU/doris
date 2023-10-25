@@ -24,10 +24,12 @@ import org.apache.doris.nereids.trees.expressions.literal.DateLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeV2Literal;
 import org.apache.doris.nereids.trees.expressions.literal.DateV2Literal;
+import org.apache.doris.nereids.trees.expressions.literal.DecimalV3Literal;
 import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 import org.apache.doris.nereids.util.DateUtils;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -490,9 +492,10 @@ public class DateTimeExtractAndTransform {
         return new IntegerLiteral(getTimestamp(date.toJavaDateType()));
     }
 
-    @ExecFunction(name = "unix_timestamp", argTypes = {"DATETIMEV2"}, returnType = "INT")
+    @ExecFunction(name = "unix_timestamp", argTypes = { "DATETIMEV2" }, returnType = "DECIMALV3")
     public static Expression unixTimestamp(DateTimeV2Literal date) {
-        return new IntegerLiteral(getTimestamp(date.toJavaDateType()));
+        String val = getTimestamp(date.toJavaDateType()).toString() + "." + date.getMicrosecondString();
+        return new DecimalV3Literal(new BigDecimal(val));
     }
 
     /**
